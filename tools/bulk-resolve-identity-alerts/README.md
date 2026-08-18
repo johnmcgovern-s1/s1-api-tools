@@ -1,5 +1,11 @@
 # bulk-resolve-identity-alerts
 
+> ⛔ **Superseded by [`s1-bulk-resolve`](../s1-bulk-resolve/).** That Python CLI
+> does everything this collection does and generalizes it: any alert filter (not
+> just Identity + `NEW`), configurable actions, a **dry-run default** with an
+> explicit `--apply` to write, and a per-alert CSV + run manifest. Prefer it for
+> new work. This collection is kept for reference and for anyone mid-transition.
+
 A Postman collection that bulk-resolves SentinelOne **Identity** alerts via the
 Unified Alerts GraphQL API. It pages through `NEW` alerts in a target scope and,
 for each page, fires one mutation that resolves every alert, sets the analyst

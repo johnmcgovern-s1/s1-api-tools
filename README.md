@@ -9,9 +9,10 @@ install`, no `requirements.txt`; copy a single file to a jump host and it runs.
 A few are a different form factor (e.g. Postman collections); each tool's README
 says what it needs.
 
-**Read vs write:** the Python tools here are read-only. Anything that **modifies
-data** is flagged ⚠️ in the table below and in its own README — check before you
-run.
+**Read vs write:** most tools here are read-only. Anything that **modifies data**
+is flagged ⚠️ in the table below and in its own README — check before you run.
+Write tools (e.g. `s1-bulk-resolve`) default to a dry run and take an explicit
+flag to actually write.
 
 ---
 
@@ -22,7 +23,7 @@ run.
 | [`sdl-k8s-process-report`](tools/sdl-k8s-process-report/) | Per-container report joined to per-node process-creation counts. Runs a query that times out in the console. Defaults to the `/api/query` paging engine for **complete results at any scale**; `--container-scope all` includes standalone Docker/Podman, not just Kubernetes. |
 | [`sdl-container-coverage`](tools/sdl-container-coverage/) | Survey and prove what container telemetry exists across runtimes (Kubernetes vs ECS vs standalone). Answers "can we see all container activity regardless of runtime?" from tenant data. |
 | [`sdl-powerquery-probe`](tools/sdl-powerquery-probe/) | Diagnose a failing PowerQuery by bisecting it — sends a ladder of progressively complex queries and reports which construct the API rejects. |
-| [`bulk-resolve-identity-alerts`](tools/bulk-resolve-identity-alerts/) | ⚠️ **Writes.** Postman collection that bulk-resolves `NEW` Identity alerts in a scope via the Unified Alerts GraphQL API (sets verdict + note). No dry-run; test-scope first. |
+| [`s1-bulk-resolve`](tools/s1-bulk-resolve/) | ⚠️ **Writes.** Bulk-resolves alerts matching a caller-defined filter in a scope via the Unified Alerts GraphQL API (sets status + optional verdict/note). Generic across alert types; **defaults to a dry run**, requires `--apply` to write, and emits a per-alert CSV + run manifest. Supersedes the `bulk-resolve-identity-alerts` Postman collection. |
 
 Each tool directory has its own README with usage, options, and output.
 
@@ -56,6 +57,10 @@ SDL tools want an SDL key scoped to the operation — **Log Read Access** for
 queries. A SentinelOne console user API token also works against the SDL API.
 Pass it via `S1_SDL_TOKEN` rather than `--token` so it stays out of your shell
 history, and `unset` it when you're done.
+
+The **console** tools (e.g. `s1-bulk-resolve`, which hits the Unified Alerts
+GraphQL API on the console host itself — not an `xdr.*` SDL host) instead use a
+console API token via `S1_CONSOLE_TOKEN`. Same principle: env var, not `--token`.
 
 ### Hosts: the SDL endpoint is not your console
 
