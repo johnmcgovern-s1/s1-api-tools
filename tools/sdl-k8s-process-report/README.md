@@ -1,8 +1,8 @@
 # sdl-k8s-process-report
 
-Per-container Kubernetes report joined to per-node process-creation counts, over
-the Singularity Data Lake PowerQuery API. Use it when the equivalent console
-query times out — which it does on any sizeable fleet.
+Per-container report joined to per-node process-creation counts, over the
+Singularity Data Lake API. Use it when the equivalent console query times out —
+which it does on any sizeable fleet.
 
 - **Step 1** counts `Process Creation` events per Kubernetes node (`agent.uuid`).
 - **Step 2** pulls container/pod/label detail for container events in the window,
@@ -10,6 +10,9 @@ query times out — which it does on any sizeable fleet.
 
 Output is one CSV: `eventCount` first, then `endpoint.name`, `agent.uuid`, and
 the `k8sCluster.*` columns.
+
+By default Step 2 uses the **`query` engine**, which pages results to completion
+(`--engine`, below) — so you get complete results even on very large fleets.
 
 ## Container scope: Kubernetes only, or every runtime?
 
@@ -72,33 +75,55 @@ Two related syntax notes:
 The practical consequence: **the two-step console instructions can't be automated
 as written.** Anything scripted against this data needs the client-side join.
 
-## Gotcha 2: PowerQuery has no pagination
+## Completeness: two engines (`--engine`)
 
-`/api/powerQuery` is **synchronous and carries neither `maxCount` nor
-`continuationToken`** — compare `/api/query`, which has both. Switching to
-`/api/query` isn't an option: `group` and `columns` are PowerQuery-only.
+Getting **complete** results at scale is the crux. PowerQuery can't guarantee it;
+the `/api/query` endpoint can. The tool supports both, and **defaults to the
+complete one**.
 
-What PowerQuery reports instead is **`omittedEvents`** — rows silently dropped
-when a result exceeds the server's in-memory limit. So a single large call can
-return a *quietly incomplete* table with HTTP 200 and `status: success`. **That,
-not the timeout, is the real hazard**, and it's the reason to use this rather
-than a hand-rolled curl call.
+### `--engine query` (default) — complete at any scale
 
-The only way to page it is client-driven **time-slicing**:
+`/api/query` supports `continuationToken` **paging**: each time-slice is paged to
+exhaustion, so every matching event is returned no matter how many there are.
+This is the only option that stays complete on a very high-density fleet — e.g.
+**100k's of containers per instant**, where time-slicing alone can't help because
+the bottleneck is rows-per-*instant*, not rows-per-window. Slower (sequential
+paging), but complete.
 
-- **Step 1** aggregates to one row per node, so it's very unlikely to truncate —
-  the console limit it hits is a UI/gateway timeout, not the backend's compute
-  budget. It runs as one call with a 600s client-side timeout.
-- **Step 2** returns one row per raw event, so it's sliced. Any slice reporting
-  `omittedEvents > 0` is **bisected and retried** down to `--min-slice-minutes`;
-  the truncated response is discarded in favour of its halves. If a slice is
-  still truncated at the floor, the tool **warns and reports the approximate rows
-  lost** rather than presenting a partial CSV as complete.
-- Rows stream to CSV as they arrive, with a checkpoint after each top-level
-  slice, so an interrupted run resumes instead of restarting.
+> **Unverified caveat:** the `/api/query` `columns` selection of the
+> `k8sCluster.*` fields hasn't been confirmed against a live tenant. The engine
+> **self-checks**: if a page returns events but every `k8sCluster.*` column is
+> blank, it warns loudly and tells you to fall back to `--engine powerquery`.
+> Your first real run is the verification — check the columns look right.
 
-Time bounds go out as absolute epoch-ms, never relative (`24h`), so slices are
-stable and reproducible across a long run.
+### `--engine powerquery` — fast, but drops overflow at extreme scale
+
+`/api/powerQuery` carries neither `maxCount` nor `continuationToken`, and signals
+over-limit results only via **`omittedEvents`** — rows silently dropped when a
+result exceeds the server's in-memory cap, returned with HTTP 200 and
+`status: success`. This engine time-slices and **bisects** any slice reporting
+`omittedEvents > 0` down to `--min-slice-minutes`. Below that floor it **drops
+the overflow** (with a warning and an approximate lost-row count). Fine for
+modest fleets; **not** suitable when instantaneous event density exceeds the cap
+— which is exactly the case this tool's `query` engine exists to handle.
+
+### Both engines
+
+- **Step 1** (per-node `eventCount`) always uses PowerQuery — its output is one
+  row per node, so truncation is unlikely.
+- Step 2 is time-sliced either way (for `query`, only to bound checkpoint/resume
+  granularity — `--min-slice-minutes` is ignored there).
+- Rows stream to CSV as they arrive, with a checkpoint after each slice, so an
+  interrupted run resumes.
+- Time bounds go out as absolute epoch-ms, never relative (`24h`), so slices are
+  stable and reproducible.
+
+**Window size, not query complexity, is the dominant cost.** A fleet-wide
+aggregation (e.g. counting all Process Creation, unfiltered) times out even over
+a few minutes, while the same query over a small window returns instantly. Every
+query here leads with an indexed `field = value` filter and Step 2 is sliced, so
+this is handled — but keep it in mind if you adapt the queries: filter first, and
+widen the window gradually.
 
 **Window size, not query complexity, is the dominant cost.** A fleet-wide
 aggregation (e.g. counting all Process Creation, unfiltered) times out even over
@@ -148,11 +173,12 @@ the mapping table in the [root README](../../README.md).
 |---|---|---|
 | `--host` | *required* | SDL endpoint, e.g. `xdr.us1.sentinelone.net` |
 | `--token` | `$S1_SDL_TOKEN` | Prefer the env var |
+| `--engine` | `query` | `query` = complete via `/api/query` paging (any scale, slower); `powerquery` = faster, drops overflow at extreme scale |
 | `--container-scope` | `k8s` | `k8s` = Kubernetes clusters only; `all` = every container incl. standalone Docker/Podman |
 | `--hours` | `24` | Window ending now; ignored if `--start` is given |
 | `--start` / `--end` | — | Absolute ISO 8601 bounds, e.g. `2026-08-17T00:00:00Z` |
-| `--slice-minutes` | `60` | Step 2 top-level slice width |
-| `--min-slice-minutes` | `1` | Bisection floor for truncated slices |
+| `--slice-minutes` | `60` | Step 2 slice width. For `query`, sets checkpoint granularity only |
+| `--min-slice-minutes` | `1` | Bisection floor for truncated slices. `powerquery` engine only |
 | `--split-minutes` | `0` (single file) | Split output into one CSV per N-minute interval; must be a multiple of `--slice-minutes` |
 | `--priority` | `low` | `low` has more generous rate limits |
 | `--out-dir` | `<repo>/reports/k8s` | CSVs + checkpoint land here; resolved from the script's location, not the cwd |

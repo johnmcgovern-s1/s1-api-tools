@@ -19,7 +19,7 @@ run.
 
 | Tool | Use it for |
 |---|---|
-| [`sdl-k8s-process-report`](tools/sdl-k8s-process-report/) | Per-container report joined to per-node process-creation counts, over the SDL PowerQuery API. Pages a query that times out in the console. `--container-scope all` includes standalone Docker/Podman, not just Kubernetes. |
+| [`sdl-k8s-process-report`](tools/sdl-k8s-process-report/) | Per-container report joined to per-node process-creation counts. Runs a query that times out in the console. Defaults to the `/api/query` paging engine for **complete results at any scale**; `--container-scope all` includes standalone Docker/Podman, not just Kubernetes. |
 | [`sdl-container-coverage`](tools/sdl-container-coverage/) | Survey and prove what container telemetry exists across runtimes (Kubernetes vs ECS vs standalone). Answers "can we see all container activity regardless of runtime?" from tenant data. |
 | [`sdl-powerquery-probe`](tools/sdl-powerquery-probe/) | Diagnose a failing PowerQuery by bisecting it — sends a ladder of progressively complex queries and reports which construct the API rejects. |
 | [`bulk-resolve-identity-alerts`](tools/bulk-resolve-identity-alerts/) | ⚠️ **Writes.** Postman collection that bulk-resolves `NEW` Identity alerts in a scope via the Unified Alerts GraphQL API (sets verdict + note). No dry-run; test-scope first. |

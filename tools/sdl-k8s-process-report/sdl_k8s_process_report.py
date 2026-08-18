@@ -45,20 +45,27 @@ Workaround 1 — the join happens **client-side**.
   — "For JSON requests, single quotes are invalid, and you must \\" escape double
   quotes in strings" (SDL powerQuery docs).
 
-Workaround 2 — pagination is **client-driven time-slicing**.
+Workaround 2 — completeness. Two Step 2 engines, selectable with --engine:
 
-  `/api/powerQuery` is synchronous and carries neither `maxCount` nor
-  `continuationToken` — compare `/api/query`, which has both. It signals
-  over-limit results only via `omittedEvents`, so a single large call can return
-  a *quietly incomplete* table with HTTP 200 and `status: success`. That, not the
-  timeout, is the real hazard.
+  query (DEFAULT) — the /api/query endpoint, which supports `continuationToken`
+  paging. Each time-slice is paged to exhaustion, so EVERY matching event is
+  returned regardless of result-set size. This is the only way to guarantee
+  completeness on a very high-density fleet (100k's of containers per instant).
+  Slower (sequential paging), and — flagged honestly — the /api/query `columns`
+  selection of `k8sCluster.*` fields is unverified against a live tenant, so the
+  engine warns loudly if a page returns rows with those columns all blank.
 
-  Step 1 aggregates to one row per node and is very unlikely to truncate (the
-  console limit it hits is a UI/gateway timeout, not the backend's compute
-  budget), so it runs as one call. Step 2 returns one row per raw event, so it is
-  sliced; any slice reporting `omittedEvents > 0` is bisected and retried down to
-  `--min-slice-minutes`. Rows stream to CSV as they arrive, with a checkpoint so
-  an interrupted run resumes instead of restarting.
+  powerquery — the /api/powerQuery endpoint, which carries neither `maxCount` nor
+  `continuationToken` and signals over-limit results only via `omittedEvents`. A
+  single call can return a *quietly incomplete* table with HTTP 200. This engine
+  time-slices and bisects on `omittedEvents > 0` down to `--min-slice-minutes`,
+  but below that floor it DROPS overflow rows (with a warning). Faster; fine for
+  modest fleets; unsuitable when instantaneous event density exceeds the cap.
+
+  Either way Step 2 is time-sliced (for the query engine, only to bound
+  checkpoint/resume granularity), rows stream to CSV as they arrive, and a
+  checkpoint lets an interrupted run resume. Step 1 (the per-node count) always
+  uses powerQuery — its output is one row per node, so truncation is unlikely.
 
 Time bounds go out as absolute epoch-ms, never relative ("24h"), so slices are
 stable and reproducible across a long run. Step 1 and Step 2 should use the same
@@ -171,29 +178,21 @@ REQUEST_TIMEOUT_SECONDS = 600
 
 # --- API --------------------------------------------------------------------
 
-def run_power_query(host, token, query, start_ms, end_ms, priority="low"):
-    """POST one PowerQuery call, retrying 429/5xx/network errors with backoff.
+def post_json(url, token, payload, what):
+    """POST a JSON payload, retrying 429/5xx/network errors with backoff.
 
     Returns the parsed JSON body. The HTTP status can be 200 while `status` in
-    the body is an error, so callers must check that too.
+    the body is an error, so callers must check that too. `what` names the call
+    for error messages (e.g. "powerQuery", "query").
     """
-    payload = json.dumps({
-        "query": query,
-        "startTime": str(start_ms),
-        "endTime": str(end_ms),
-        "priority": priority,
-    }).encode("utf-8")
-    headers = {
-        "Authorization": "Bearer %s" % token,
-        "Content-Type": "application/json",
-    }
-    url = "https://%s/api/powerQuery" % host
+    data = json.dumps(payload).encode("utf-8")
+    headers = {"Authorization": "Bearer %s" % token, "Content-Type": "application/json"}
     context = ssl.create_default_context()
 
     backoff = INITIAL_BACKOFF_SECONDS
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
-        request = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+        request = urllib.request.Request(url, data=data, headers=headers, method="POST")
         try:
             with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS,
                                         context=context) as response:
@@ -206,31 +205,84 @@ def run_power_query(host, token, query, start_ms, end_ms, priority="low"):
                 # Always show the body: the API puts the real reason there, and a
                 # 500 caused by a malformed query will never succeed on retry, so
                 # the operator needs to see why on the FIRST attempt, not the last.
-                warn("HTTP %d from API; retrying in %.0fs (attempt %d/%d). "
+                warn("HTTP %d from %s; retrying in %.0fs (attempt %d/%d). "
                      "Response body: %s"
-                     % (exc.code, wait, attempt, MAX_RETRIES, body.strip()[:500] or "(empty)"))
+                     % (exc.code, what, wait, attempt, MAX_RETRIES,
+                        body.strip()[:500] or "(empty)"))
                 time.sleep(wait)
                 backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
                 continue
-            raise RuntimeError("powerQuery failed: HTTP %d: %s" % (exc.code, body))
+            raise RuntimeError("%s failed: HTTP %d: %s" % (what, exc.code, body))
         except (urllib.error.URLError, TimeoutError, OSError,
                 http.client.HTTPException, ValueError) as exc:
             # http.client.HTTPException covers IncompleteRead — the server
             # truncating a chunked response mid-body, which happens on long
-            # PowerQuery calls. It subclasses HTTPException, NOT OSError, so it
-            # is not covered by URLError/OSError and would otherwise crash the
-            # run mid-slice. ValueError covers a JSON decode failure on a
-            # partial body. Both are transient: retry.
+            # calls. It subclasses HTTPException, NOT OSError, so it is not
+            # covered by URLError/OSError and would otherwise crash the run
+            # mid-slice. ValueError covers a JSON decode failure on a partial
+            # body. Both are transient: retry.
             last_error = exc
             if attempt == MAX_RETRIES:
                 break
-            warn("%s while reading the response (%s); retrying in %ds "
+            warn("%s while reading the %s response (%s); retrying in %ds "
                  "(attempt %d/%d)"
-                 % (type(exc).__name__, exc, backoff, attempt, MAX_RETRIES))
+                 % (type(exc).__name__, what, exc, backoff, attempt, MAX_RETRIES))
             time.sleep(backoff)
             backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
 
-    raise RuntimeError("powerQuery failed after %d retries: %s" % (MAX_RETRIES, last_error))
+    raise RuntimeError("%s failed after %d retries: %s" % (what, MAX_RETRIES, last_error))
+
+
+def run_power_query(host, token, query, start_ms, end_ms, priority="low"):
+    """POST one PowerQuery call. Returns the parsed JSON body."""
+    return post_json("https://%s/api/powerQuery" % host, token, {
+        "query": query,
+        "startTime": str(start_ms),
+        "endTime": str(end_ms),
+        "priority": priority,
+    }, "powerQuery")
+
+
+# Max events per /api/query page. The endpoint caps this at 5000.
+QUERY_PAGE_SIZE = 5000
+
+
+def run_query_page(host, token, filter_expr, columns_csv, start_ms, end_ms,
+                   priority, continuation_token):
+    """POST one /api/query page. Returns the parsed JSON body.
+
+    Unlike powerQuery, /api/query supports `continuationToken` paging, so a
+    caller can walk EVERY matching event regardless of result-set size — this is
+    the completeness mechanism powerQuery lacks. Times must be absolute (we pass
+    epoch ms) for paging to be stable.
+    """
+    payload = {
+        "queryType": "log",
+        "filter": filter_expr,
+        "columns": columns_csv,
+        "startTime": str(start_ms),
+        "endTime": str(end_ms),
+        "maxCount": QUERY_PAGE_SIZE,
+        "pageMode": "head",  # oldest-first; page forward to completeness
+        "priority": priority,
+    }
+    if continuation_token:
+        payload["continuationToken"] = continuation_token
+    return post_json("https://%s/api/query" % host, token, payload, "query")
+
+
+def row_from_match(match, columns):
+    """Flatten one /api/query match into a raw-cell row aligned to `columns`.
+
+    The selected fields come back under `attributes` (parser fields) or, for
+    built-ins like `timestamp`, at the top level. We check both, top level
+    first. NOTE: which dotted fields (`k8sCluster.*`) the endpoint returns via
+    `columns` is unverified against a live tenant — this reads defensively so a
+    missing field becomes an empty cell rather than an error. Returns raw cells;
+    join_and_write() renders them.
+    """
+    attributes = match.get("attributes") or {}
+    return [match.get(name, attributes.get(name)) for name in columns]
 
 
 def cell_to_str(cell):
@@ -443,6 +495,22 @@ def existing_output_paths(out_dir):
 
 # --- Step 2: sliced detail dump with the client-side join -------------------
 
+def join_and_write(rows, start_ms, output, counts, key_at, stats):
+    """Prepend the joined eventCount (looked up on JOIN_KEY) to each row and
+    write it. `rows` are raw cells aligned to STEP2_COLUMNS. Shared by both
+    engines so the join and output format never drift."""
+    if output.header_row is None:
+        output.header_row = [JOINED_COLUMN] + list(STEP2_COLUMNS)
+    rendered = []
+    for row in rows:
+        key = str(cell_to_str(row[key_at]))
+        count = counts.get(key, "")
+        if count == "":
+            stats["unmatched_rows"] += 1
+        rendered.append([count] + [cell_to_str(c) for c in row])
+    output.write_rows(start_ms, rendered)
+
+
 def fetch_slice(host, token, query, start_ms, end_ms, priority, min_slice_ms,
                 output, counts, stats, depth=0):
     """Fetch [start_ms, end_ms), join eventCount, write rows. Bisect and recurse
@@ -481,29 +549,85 @@ def fetch_slice(host, token, query, start_ms, end_ms, priority, min_slice_ms,
         print("%s[%d,%d) -> 0 rows" % (indent, start_ms, end_ms))
         return
 
-    # The join: prepend eventCount, looked up by agent.uuid.
     key_at = column_index(response, JOIN_KEY, "Step 2")
-    if output.header_row is None:
-        names = [c.get("name") for c in response.get("columns", [])]
-        output.header_row = [JOINED_COLUMN] + names
-
-    rendered = []
-    for row in values:
-        key = str(cell_to_str(row[key_at]))
-        count = counts.get(key, "")
-        if count == "":
-            stats["unmatched_rows"] += 1
-        rendered.append([count] + [cell_to_str(c) for c in row])
-    output.write_rows(start_ms, rendered)
-
+    join_and_write(values, start_ms, output, counts, key_at, stats)
     stats["rows"] += len(values)
     stats["slices"] += 1
     print("%s[%d,%d) -> %d rows (matchingEvents=%s)"
           % (indent, start_ms, end_ms, len(values), response.get("matchingEvents", 0)))
 
 
-def run_step2(host, token, query, start_ms, end_ms, priority, slice_minutes,
-              min_slice_minutes, out_dir, fresh, counts, split_minutes=0):
+# Safety cap: pages per slice before we assume the token isn't converging. At
+# 5000 rows/page this is 50M rows in one slice — far beyond any real slice, so
+# hitting it means something is wrong (e.g. a token that never clears).
+MAX_PAGES_PER_SLICE = 10000
+
+
+def fetch_slice_paged(host, token, filter_expr, start_ms, end_ms, priority,
+                      output, counts, stats):
+    """Fetch [start_ms, end_ms) COMPLETELY via /api/query continuationToken
+    paging, join eventCount, write rows. No bisection and no omittedEvents —
+    paging walks every matching event, which is the whole point of this engine.
+
+    Coarse time-slices still exist (for checkpoint/resume granularity), but each
+    slice is paged to exhaustion, so no rows are dropped at any scale."""
+    key_at = STEP2_COLUMNS.index(JOIN_KEY)
+    columns_csv = ",".join(STEP2_COLUMNS)
+    token_cursor = None
+    slice_rows = 0
+    pages = 0
+    while True:
+        response = run_query_page(host, token, filter_expr, columns_csv,
+                                  start_ms, end_ms, priority, token_cursor)
+        if response.get("status") not in ("success", None):
+            # /api/query success is signalled by absence of an error status.
+            if str(response.get("status", "")).startswith("error"):
+                raise RuntimeError("Step 2 query failed for slice [%d, %d): %s"
+                                   % (start_ms, end_ms, response))
+        matches = response.get("matches", [])
+        if matches:
+            rows = [row_from_match(m, STEP2_COLUMNS) for m in matches]
+            _sanity_check_columns(rows, stats)
+            join_and_write(rows, start_ms, output, counts, key_at, stats)
+            slice_rows += len(rows)
+            stats["rows"] += len(rows)
+        pages += 1
+        token_cursor = response.get("continuationToken")
+        # Stop when a page returns no events. The token can persist past the end,
+        # so empty matches — not a null token — is the reliable terminator.
+        if not matches:
+            break
+        if pages >= MAX_PAGES_PER_SLICE:
+            warn("[%d,%d) hit the %d-page safety cap after %d rows; stopping this "
+                 "slice. Results may be incomplete — narrow --slice-minutes."
+                 % (start_ms, end_ms, MAX_PAGES_PER_SLICE, slice_rows))
+            stats["unresolved_slices"] += 1
+            break
+    stats["slices"] += 1
+    print("  [%d,%d) -> %d rows in %d page(s)" % (start_ms, end_ms, slice_rows, pages))
+
+
+def _sanity_check_columns(rows, stats):
+    """First time we see rows in the query engine, verify the k8sCluster.* columns
+    actually populated. If a whole batch has them all blank, the /api/query
+    `columns` selection probably isn't returning these fields — warn loudly once,
+    since this engine is unverified against a live tenant."""
+    if stats.get("_col_checked"):
+        return
+    stats["_col_checked"] = True
+    container_idx = [i for i, c in enumerate(STEP2_COLUMNS) if c.startswith("k8sCluster.")]
+    any_populated = any(
+        rows[r][i] not in (None, "") for r in range(len(rows)) for i in container_idx)
+    if rows and not any_populated:
+        warn("query engine: returned %d rows but every k8sCluster.* column is "
+             "blank. The /api/query `columns` selection may not return these "
+             "fields on this tenant. Verify, or fall back to --engine powerquery."
+             % len(rows))
+
+
+def run_step2(host, token, engine, pq_query, container_filter, start_ms, end_ms,
+              priority, slice_minutes, min_slice_minutes, out_dir, fresh, counts,
+              split_minutes=0):
     checkpoint_path = os.path.join(out_dir, STEP2_CSV_NAME) + ".checkpoint.json"
     split_ms = split_minutes * 60 * 1000
 
@@ -525,9 +649,14 @@ def run_step2(host, token, query, start_ms, end_ms, priority, slice_minutes,
 
     slices = build_slices(resume_from, end_ms, slice_minutes)
     min_slice_ms = min_slice_minutes * 60 * 1000
-    print("Step 2: %d top-level slice(s) of %d min, bisecting to %d min on "
-          "truncation, over [%d, %d)"
-          % (len(slices), slice_minutes, min_slice_minutes, resume_from, end_ms))
+    if engine == "query":
+        print("Step 2 [engine=query]: %d slice(s) of %d min over [%d, %d); each "
+              "slice paged to completion via continuationToken (complete at any "
+              "scale)." % (len(slices), slice_minutes, resume_from, end_ms))
+    else:
+        print("Step 2 [engine=powerquery]: %d slice(s) of %d min, bisecting to %d "
+              "min on truncation, over [%d, %d)."
+              % (len(slices), slice_minutes, min_slice_minutes, resume_from, end_ms))
     if split_ms:
         print("        splitting output every %d min (one CSV per interval)"
               % split_minutes)
@@ -540,8 +669,12 @@ def run_step2(host, token, query, start_ms, end_ms, priority, slice_minutes,
     try:
         for index, (slice_start, slice_end) in enumerate(slices, start=1):
             print("[%d/%d] slice [%d, %d)" % (index, len(slices), slice_start, slice_end))
-            fetch_slice(host, token, query, slice_start, slice_end, priority,
-                        min_slice_ms, output, counts, stats)
+            if engine == "query":
+                fetch_slice_paged(host, token, container_filter, slice_start,
+                                  slice_end, priority, output, counts, stats)
+            else:
+                fetch_slice(host, token, pq_query, slice_start, slice_end,
+                            priority, min_slice_ms, output, counts, stats)
             # Flush before checkpointing so a resume never skips buffered rows.
             output.flush()
             with open(checkpoint_path, "w") as cp:
@@ -555,7 +688,10 @@ def run_step2(host, token, query, start_ms, end_ms, priority, slice_minutes,
     for path, rows in written:
         print("  %8d rows  %s" % (rows, os.path.basename(path)))
     if written:
-        write_manifest(out_dir, query, start_ms, end_ms, written, stats)
+        manifest_query = pq_query if engine == "powerquery" else (
+            "/api/query filter=%r columns=%r (paged)"
+            % (container_filter, ",".join(STEP2_COLUMNS)))
+        write_manifest(out_dir, engine, manifest_query, start_ms, end_ms, written, stats)
     if stats["unmatched_rows"]:
         print("  %d row(s) had no Step 1 count for their %s (blank %s). Expected "
               "for containers on endpoints with no Process Creation events in the "
@@ -563,18 +699,26 @@ def run_step2(host, token, query, start_ms, end_ms, priority, slice_minutes,
               "(Step 1 only counts kubernetes nodes)."
               % (stats["unmatched_rows"], JOIN_KEY, JOINED_COLUMN))
     if stats["unresolved_slices"]:
-        warn("%d slice(s) hit the floor still truncated, dropping roughly %d rows. "
-             "Re-run with a smaller --min-slice-minutes to close the gap."
-             % (stats["unresolved_slices"], stats["unresolved_omitted"]))
+        if engine == "query":
+            warn("%d slice(s) hit the page-safety cap and may be incomplete. "
+                 "Narrow --slice-minutes and re-run." % stats["unresolved_slices"])
+        else:
+            warn("%d slice(s) hit the floor still truncated, dropping roughly %d "
+                 "rows. Re-run with a smaller --min-slice-minutes, or switch to "
+                 "--engine query for guaranteed completeness."
+                 % (stats["unresolved_slices"], stats["unresolved_omitted"]))
+    elif engine == "query":
+        print("  Every slice paged to completion — output is complete for this window.")
     else:
         print("  No unresolved truncation — the output is complete for this window.")
 
 
-def write_manifest(out_dir, step2_query, start_ms, end_ms, written, stats):
+def write_manifest(out_dir, engine, step2_query, start_ms, end_ms, written, stats):
     """Record what was produced, so a multi-file deliverable is self-describing."""
     base = STEP2_CSV_NAME[:-len(".csv")]
     path = os.path.join(out_dir, base + "_manifest.json")
     manifest = {
+        "engine": engine,
         "window": {
             "startMs": start_ms,
             "endMs": end_ms,
@@ -622,12 +766,22 @@ def main():
                              "(k8sCluster.containerImage). In 'all', non-k8s rows "
                              "have blank cluster/namespace/podName and blank "
                              "eventCount.")
+    parser.add_argument("--engine", choices=["query", "powerquery"], default="query",
+                        help="Step 2 fetch engine. 'query' (default): the "
+                             "/api/query endpoint with continuationToken paging — "
+                             "COMPLETE results at any scale, slower. 'powerquery': "
+                             "the /api/powerQuery endpoint with time-slice "
+                             "bisection — faster, but drops overflow rows when a "
+                             "slice exceeds the in-memory result cap (unsuitable "
+                             "for very high-density fleets).")
     parser.add_argument("--priority", choices=["low", "high"], default="low",
                         help="Query priority (default low: more generous rate limits).")
     parser.add_argument("--slice-minutes", type=int, default=60,
-                        help="Step 2 top-level slice width (default 60).")
+                        help="Step 2 top-level slice width (default 60). For "
+                             "engine=query this only sets checkpoint granularity.")
     parser.add_argument("--min-slice-minutes", type=int, default=1,
-                        help="Bisection floor for truncated slices (default 1).")
+                        help="Bisection floor for truncated slices (default 1). "
+                             "Only used by engine=powerquery.")
     parser.add_argument("--split-minutes", type=int, default=0, metavar="N",
                         help="Split output into one CSV per N-minute interval "
                              "(e.g. 60 = hourly). Must be a multiple of "
@@ -676,20 +830,28 @@ def main():
         parser.error("the window is empty: start (%s) is not before end (%s)"
                      % (start.isoformat(), end.isoformat()))
 
+    container_filter = CONTAINER_SCOPES[args.container_scope]
     step2_query = build_step2_query(args.container_scope)
 
     start_ms, end_ms = to_epoch_ms(start), to_epoch_ms(end)
     print("Window: %s -> %s  (%d -> %d ms)"
           % (start.isoformat(), end.isoformat(), start_ms, end_ms))
+    print("Engine: %s%s"
+          % (args.engine, "  (complete, paged)" if args.engine == "query"
+             else "  (fast, may drop overflow at high scale)"))
     print("Container scope: %s (%s)"
-          % (args.container_scope, CONTAINER_SCOPES[args.container_scope]))
+          % (args.container_scope, container_filter))
     # Always state the resolved absolute path, so where output landed is never a
     # guess — a relative --out-dir is easy to misjudge.
     print("Output: %s" % os.path.abspath(args.out_dir))
 
     if args.dry_run:
-        print("\nStep 1 query:\n  %s" % QUERY_STEP1)
-        print("\nStep 2 query:\n  %s" % step2_query)
+        print("\nStep 1 query (powerQuery):\n  %s" % QUERY_STEP1)
+        if args.engine == "query":
+            print("\nStep 2 (/api/query, paged):\n  filter: %s\n  columns: %s"
+                  % (container_filter, ",".join(STEP2_COLUMNS)))
+        else:
+            print("\nStep 2 query (powerQuery):\n  %s" % step2_query)
         print("\n%s is joined client-side on %s." % (JOINED_COLUMN, JOIN_KEY))
         slices = build_slices(start_ms, end_ms, args.slice_minutes)
         if args.split_minutes:
@@ -713,9 +875,10 @@ def main():
         counts = run_step1(args.host, args.token, start_ms, end_ms,
                            args.priority, args.out_dir)
     if not args.step1_only:
-        run_step2(args.host, args.token, step2_query, start_ms, end_ms, args.priority,
-                  args.slice_minutes, args.min_slice_minutes, args.out_dir,
-                  args.fresh, counts, args.split_minutes)
+        run_step2(args.host, args.token, args.engine, step2_query, container_filter,
+                  start_ms, end_ms, args.priority, args.slice_minutes,
+                  args.min_slice_minutes, args.out_dir, args.fresh, counts,
+                  args.split_minutes)
 
 
 if __name__ == "__main__":
