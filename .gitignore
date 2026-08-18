@@ -1,0 +1,66 @@
+# ---------------------------------------------------------------------------
+# Tool output — CONTAINS CUSTOMER DATA. Never commit.
+# Tools write hostnames, container images, pod names, namespaces and labels.
+# These patterns are a backstop; prefer an --out-dir outside the repo entirely.
+# ---------------------------------------------------------------------------
+*.csv
+*.tsv
+*.csv.checkpoint.json
+*.checkpoint.json
+
+# reports/ is the DEFAULT output location for every tool (reports/<tool>/), so it
+# must stay ignored — that is where customer data lands.
+# Other conventional --out-dir targets follow. All anchored to the repo root.
+# Do NOT use unanchored globs like *-report/ here: that pattern also matches tool
+# directories (e.g. tools/sdl-k8s-process-report/) and silently ignores the code.
+# The *.csv rules above are the real backstop — they catch data anywhere.
+/out/
+/output/
+/reports/
+/report/
+/k8s_report/
+/s1_k8s_report/
+
+# Anything explicitly marked local/scratch
+/local/
+/scratch/
+/tmp/
+*.local
+*.local.*
+
+# --- Credentials (belt and braces; tools read tokens from the environment) ---
+.env
+.env.*
+*.token
+*token.txt
+secrets.*
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- macOS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# --- Editors / IDEs ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- Claude Code ---
+.claude/
