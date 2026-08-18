@@ -1,5 +1,11 @@
 # Contributing
 
+Most tools here are **command-line Python**. Some are a different form factor —
+e.g. a Postman collection — where a script doesn't fit the workflow. The rules
+below are written for the Python tools (the common case); for a non-Python tool,
+follow the ones that apply (env-based secrets, one directory + README, no
+committed output, README table entry) and skip the Python-specific ones.
+
 ## The rules
 
 1. **Pure Python 3 standard library.** No `pip install`, no `requirements.txt`.
@@ -12,10 +18,10 @@
    ```
    tools/<tool-name>/
      README.md
-     <tool_name>.py
+     <tool_name>.py        # or a Postman collection, etc.
    ```
-   Snake_case the module, kebab-case the directory. A tool should be a **single
-   file** where practical, so it can be copied on its own.
+   Snake_case the module, kebab-case the directory. A Python tool should be a
+   **single file** where practical, so it can be copied on its own.
 3. **Tokens come from the environment**, never a file in the repo and never a
    default in the code. Accept `--token` as an override but document the env var
    (`S1_SDL_TOKEN` for Data Lake) as the preferred path.
@@ -30,6 +36,11 @@
      unanchored globs like `*-report/` — that also matches tool directories such
      as `tools/sdl-k8s-process-report/` and silently ignores the code.
 6. **Add the tool to the table in [README.md](README.md).**
+7. **Flag tools that modify data.** Most tools here are read-only. If a tool
+   creates, updates, resolves, deletes, or otherwise mutates state, mark it ⚠️ in
+   the README table and open its own README with a prominent warning: what it
+   changes, that there's no undo, and to test against a non-production scope
+   first. A reader must never mistake a write tool for a read-only one.
 
 ## What a good tool does
 

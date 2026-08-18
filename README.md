@@ -1,11 +1,17 @@
 # SentinelOne API Tools
 
-Runnable command-line tools that call the SentinelOne APIs to do things the
-console can't — reports too large for the UI, bulk extracts, diagnostics.
+Tools and utilities that call the SentinelOne APIs to do things the console
+can't — reports too large for the UI, bulk extracts, diagnostics, and bulk
+actions.
 
-Every tool is **pure Python 3 standard library** — no `pip install`, no
-`requirements.txt`. Copy a single file to a jump host, or hand it to a customer,
-and it runs.
+Most tools are **command-line, pure Python 3 standard library** — no `pip
+install`, no `requirements.txt`; copy a single file to a jump host and it runs.
+A few are a different form factor (e.g. Postman collections); each tool's README
+says what it needs.
+
+**Read vs write:** the Python tools here are read-only. Anything that **modifies
+data** is flagged ⚠️ in the table below and in its own README — check before you
+run.
 
 ---
 
@@ -16,6 +22,7 @@ and it runs.
 | [`sdl-k8s-process-report`](tools/sdl-k8s-process-report/) | Per-container report joined to per-node process-creation counts, over the SDL PowerQuery API. Pages a query that times out in the console. `--container-scope all` includes standalone Docker/Podman, not just Kubernetes. |
 | [`sdl-container-coverage`](tools/sdl-container-coverage/) | Survey and prove what container telemetry exists across runtimes (Kubernetes vs ECS vs standalone). Answers "can we see all container activity regardless of runtime?" from tenant data. |
 | [`sdl-powerquery-probe`](tools/sdl-powerquery-probe/) | Diagnose a failing PowerQuery by bisecting it — sends a ladder of progressively complex queries and reports which construct the API rejects. |
+| [`bulk-resolve-identity-alerts`](tools/bulk-resolve-identity-alerts/) | ⚠️ **Writes.** Postman collection that bulk-resolves `NEW` Identity alerts in a scope via the Unified Alerts GraphQL API (sets verdict + note). No dry-run; test-scope first. |
 
 Each tool directory has its own README with usage, options, and output.
 
