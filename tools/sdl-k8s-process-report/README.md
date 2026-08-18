@@ -5,14 +5,40 @@ the Singularity Data Lake PowerQuery API. Use it when the equivalent console
 query times out — which it does on any sizeable fleet.
 
 - **Step 1** counts `Process Creation` events per Kubernetes node (`agent.uuid`).
-- **Step 2** pulls container/pod/label detail for every `k8sCluster.*` event in
-  the window, one row per matching event, and attaches each row's node count
-  from Step 1.
+- **Step 2** pulls container/pod/label detail for container events in the window,
+  one row per matching event, and attaches each row's node count from Step 1.
 
 Output is one CSV: `eventCount` first, then `endpoint.name`, `agent.uuid`, and
 the `k8sCluster.*` columns.
 
-## Gotcha 1: `savelookup` / `lookup` don't work over the API
+## Container scope: Kubernetes only, or every runtime?
+
+The `k8sCluster.*` field family is a **misnomer**. Verified against a live tenant:
+`k8sCluster.containerImage` and `k8sCluster.containerName` also populate for
+**standalone containers (Docker/Podman) under the Linux agent** on ordinary
+`server` endpoints — not just Kubernetes. The `k8sCluster.name` (cluster) field
+is what's actually K8s-specific.
+
+`--container-scope` sets the Step 2 filter accordingly:
+
+| Scope | Step 2 filter | Captures |
+|---|---|---|
+| `k8s` (default) | `k8sCluster.name = *` | Only containers **in a Kubernetes cluster** — unchanged behaviour |
+| `all` | `k8sCluster.containerImage = *` | **Every container the agent tags** — K8s pods *and* standalone Docker/Podman |
+
+```bash
+# fleet-wide container activity, any runtime
+python3 tools/sdl-k8s-process-report/sdl_k8s_process_report.py \
+    --host xdr.us1.sentinelone.net --hours 24 --container-scope all
+```
+
+In `all` scope, rows on non-Kubernetes endpoints have **blank `k8sCluster.name`,
+`namespace`, and `podName`** (they aren't pods) and a **blank `eventCount`**
+(Step 1 counts Process Creation only on `kubernetes node` endpoints). Both are
+expected, not bugs — the blank cluster/pod columns are how you tell a standalone
+container from a K8s one.
+
+## Gotcha 1: `savelookup` write fails over the API (`lookup` read is fine)
 
 The console version of this report used `savelookup` to write Step 1's aggregate
 to a server-side CSV, then `lookup` to join it back in Step 2. Over the API that
@@ -24,7 +50,9 @@ HTTP 500  {"message":"internal Scalyr error while processing this query","status
 
 deterministically — `savelookup` writes to the tenant's shared file namespace,
 which a read-scoped query can't do. The 500 is generic, not a validation error,
-so it gives no hint on its own.
+so it gives no hint on its own. (The `lookup` *read* is supported — pointing it at
+a missing file returns a clean `400 error/client/badParam` — but with no way to
+create the file over a read-scoped API, the pair is unusable.)
 
 **So the join is done client-side**: Step 1's counts are held in memory (and
 cached to CSV), and `eventCount` is attached to each Step 2 row in Python, keyed
@@ -72,6 +100,13 @@ The only way to page it is client-driven **time-slicing**:
 Time bounds go out as absolute epoch-ms, never relative (`24h`), so slices are
 stable and reproducible across a long run.
 
+**Window size, not query complexity, is the dominant cost.** A fleet-wide
+aggregation (e.g. counting all Process Creation, unfiltered) times out even over
+a few minutes, while the same query over a small window returns instantly. Every
+query here leads with an indexed `field = value` filter and Step 2 is sliced, so
+this is handled — but keep it in mind if you adapt the queries: filter first, and
+widen the window gradually.
+
 ## Usage
 
 ```bash
@@ -113,6 +148,7 @@ the mapping table in the [root README](../../README.md).
 |---|---|---|
 | `--host` | *required* | SDL endpoint, e.g. `xdr.us1.sentinelone.net` |
 | `--token` | `$S1_SDL_TOKEN` | Prefer the env var |
+| `--container-scope` | `k8s` | `k8s` = Kubernetes clusters only; `all` = every container incl. standalone Docker/Podman |
 | `--hours` | `24` | Window ending now; ignored if `--start` is given |
 | `--start` / `--end` | — | Absolute ISO 8601 bounds, e.g. `2026-08-17T00:00:00Z` |
 | `--slice-minutes` | `60` | Step 2 top-level slice width |

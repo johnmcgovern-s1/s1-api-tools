@@ -11,16 +11,27 @@ Singularity Data Lake (DataSet) API documentation for the powerQuery spec.
 The report:
 
   Step 1  Count "Process Creation" events per Kubernetes node (`agent.uuid`).
-  Step 2  Pull container/pod/label detail for every `k8sCluster.*` event in the
-          window, and attach each row's node event count from Step 1.
+  Step 2  Pull container/pod/label detail for container events in the window, and
+          attach each row's node event count from Step 1.
+
+--container-scope decides what Step 2 pulls. The k8sCluster.* fields are a
+misnomer: containerImage/containerName also populate for standalone containers
+(Docker/Podman) under the Linux agent, not just Kubernetes.
+  k8s (default)  filter on k8sCluster.name -> containers in a K8s cluster only.
+  all            filter on k8sCluster.containerImage -> every container the agent
+                 tags. Non-k8s rows have blank cluster/namespace/podName (not
+                 pods) and blank eventCount (Step 1 only counts k8s nodes).
 
 Workaround 1 — the join happens **client-side**.
 
   The console version of this report used `savelookup` to write Step 1's
   aggregate to a server-side CSV, then `lookup` to join it back in Step 2. Over
-  the API that path returns `HTTP 500 error/server` ("internal Scalyr error while
-  processing this query"): `savelookup` writes to the tenant's shared file
-  namespace, which a read-scoped query cannot do.
+  the API, `savelookup` returns `HTTP 500 error/server` ("internal Scalyr error
+  while processing this query") because it writes to the tenant's shared file
+  namespace, which a read-scoped query cannot do. (The `lookup` read itself IS
+  supported — pointing it at a missing file returns a clean
+  `400 error/client/badParam`, not a 500 — but with no way to create the file,
+  the pair is unusable.)
 
   So Step 1's aggregate is kept in memory (and cached to CSV) and the
   `eventCount` column is attached to each Step 2 row here in Python, keyed on
@@ -99,7 +110,31 @@ STEP2_COLUMNS = [
     "k8sCluster.podName",
 ]
 
-QUERY_STEP2 = "k8sCluster.name = * | columns " + ", ".join(STEP2_COLUMNS)
+# --- Container scope: which events Step 2 pulls --------------------------------
+# The k8sCluster.* field family is a misnomer: containerImage/containerName also
+# populate for standalone containers (Docker/Podman) under the Linux agent on
+# ordinary endpoints, not just Kubernetes. So the Step 2 filter is a policy knob:
+#
+#   k8s  (default)  filter on k8sCluster.name -> only containers IN a Kubernetes
+#                   cluster. Matches the original report; behaviour unchanged.
+#   all             filter on k8sCluster.containerImage -> every container the
+#                   agent tags, orchestrated or not. Standalone-container rows
+#                   have blank k8sCluster.name / namespace / podName (they aren't
+#                   pods) and blank eventCount (Step 1 only counts k8s nodes).
+#
+# Verified against a live tenant: `k8sCluster.containerImage = * AND NOT
+# endpoint.type = "kubernetes node"` returns real standalone containers (traefik,
+# crowdsec, ...) on `server` endpoints that the `k8sCluster.name` filter misses.
+CONTAINER_SCOPES = {
+    "k8s": "k8sCluster.name = *",
+    "all": "k8sCluster.containerImage = *",
+}
+DEFAULT_CONTAINER_SCOPE = "k8s"
+
+
+def build_step2_query(scope):
+    return "%s | columns %s" % (CONTAINER_SCOPES[scope], ", ".join(STEP2_COLUMNS))
+
 
 JOIN_KEY = "agent.uuid"
 JOINED_COLUMN = "eventCount"
@@ -408,12 +443,12 @@ def existing_output_paths(out_dir):
 
 # --- Step 2: sliced detail dump with the client-side join -------------------
 
-def fetch_slice(host, token, start_ms, end_ms, priority, min_slice_ms,
+def fetch_slice(host, token, query, start_ms, end_ms, priority, min_slice_ms,
                 output, counts, stats, depth=0):
     """Fetch [start_ms, end_ms), join eventCount, write rows. Bisect and recurse
     while the result is truncated and the slice is wider than min_slice_ms."""
     indent = "  " * (depth + 1)
-    response = run_power_query(host, token, QUERY_STEP2, start_ms, end_ms, priority)
+    response = run_power_query(host, token, query, start_ms, end_ms, priority)
     if response.get("status") != "success":
         raise RuntimeError("Step 2 query failed for slice [%d, %d): %s"
                            % (start_ms, end_ms, response))
@@ -427,9 +462,9 @@ def fetch_slice(host, token, start_ms, end_ms, priority, min_slice_ms,
         # Discard this truncated response entirely; the halves supersede it.
         print("%s[%d,%d) truncated (omittedEvents=%s); bisecting at %d"
               % (indent, start_ms, end_ms, omitted, mid))
-        fetch_slice(host, token, start_ms, mid, priority, min_slice_ms,
+        fetch_slice(host, token, query, start_ms, mid, priority, min_slice_ms,
                     output, counts, stats, depth + 1)
-        fetch_slice(host, token, mid, end_ms, priority, min_slice_ms,
+        fetch_slice(host, token, query, mid, end_ms, priority, min_slice_ms,
                     output, counts, stats, depth + 1)
         return
 
@@ -467,7 +502,7 @@ def fetch_slice(host, token, start_ms, end_ms, priority, min_slice_ms,
           % (indent, start_ms, end_ms, len(values), response.get("matchingEvents", 0)))
 
 
-def run_step2(host, token, start_ms, end_ms, priority, slice_minutes,
+def run_step2(host, token, query, start_ms, end_ms, priority, slice_minutes,
               min_slice_minutes, out_dir, fresh, counts, split_minutes=0):
     checkpoint_path = os.path.join(out_dir, STEP2_CSV_NAME) + ".checkpoint.json"
     split_ms = split_minutes * 60 * 1000
@@ -505,8 +540,8 @@ def run_step2(host, token, start_ms, end_ms, priority, slice_minutes,
     try:
         for index, (slice_start, slice_end) in enumerate(slices, start=1):
             print("[%d/%d] slice [%d, %d)" % (index, len(slices), slice_start, slice_end))
-            fetch_slice(host, token, slice_start, slice_end, priority, min_slice_ms,
-                        output, counts, stats)
+            fetch_slice(host, token, query, slice_start, slice_end, priority,
+                        min_slice_ms, output, counts, stats)
             # Flush before checkpointing so a resume never skips buffered rows.
             output.flush()
             with open(checkpoint_path, "w") as cp:
@@ -520,10 +555,12 @@ def run_step2(host, token, start_ms, end_ms, priority, slice_minutes,
     for path, rows in written:
         print("  %8d rows  %s" % (rows, os.path.basename(path)))
     if written:
-        write_manifest(out_dir, start_ms, end_ms, written, stats)
+        write_manifest(out_dir, query, start_ms, end_ms, written, stats)
     if stats["unmatched_rows"]:
         print("  %d row(s) had no Step 1 count for their %s (blank %s). Expected "
-              "for pods on nodes with no Process Creation events in the window."
+              "for containers on endpoints with no Process Creation events in the "
+              "window, and always for non-Kubernetes endpoints in 'all' scope "
+              "(Step 1 only counts kubernetes nodes)."
               % (stats["unmatched_rows"], JOIN_KEY, JOINED_COLUMN))
     if stats["unresolved_slices"]:
         warn("%d slice(s) hit the floor still truncated, dropping roughly %d rows. "
@@ -533,7 +570,7 @@ def run_step2(host, token, start_ms, end_ms, priority, slice_minutes,
         print("  No unresolved truncation — the output is complete for this window.")
 
 
-def write_manifest(out_dir, start_ms, end_ms, written, stats):
+def write_manifest(out_dir, step2_query, start_ms, end_ms, written, stats):
     """Record what was produced, so a multi-file deliverable is self-describing."""
     base = STEP2_CSV_NAME[:-len(".csv")]
     path = os.path.join(out_dir, base + "_manifest.json")
@@ -546,7 +583,7 @@ def write_manifest(out_dir, start_ms, end_ms, written, stats):
             "endUtc": datetime.fromtimestamp(
                 end_ms / 1000.0, timezone.utc).isoformat(),
         },
-        "queries": {"step1": QUERY_STEP1, "step2": QUERY_STEP2},
+        "queries": {"step1": QUERY_STEP1, "step2": step2_query},
         "joinedColumn": JOINED_COLUMN,
         "joinKey": JOIN_KEY,
         "totals": {
@@ -576,6 +613,15 @@ def main():
                         help="Window ending now, in hours (default 24). Ignored with --start.")
     parser.add_argument("--start", help="Absolute start, ISO 8601, e.g. 2026-08-17T00:00:00Z")
     parser.add_argument("--end", help="Absolute end, ISO 8601. Defaults to now.")
+    parser.add_argument("--container-scope", choices=sorted(CONTAINER_SCOPES),
+                        default=DEFAULT_CONTAINER_SCOPE,
+                        help="Which containers Step 2 pulls. 'k8s' (default): only "
+                             "containers in a Kubernetes cluster (k8sCluster.name). "
+                             "'all': every container the agent tags including "
+                             "standalone Docker/Podman on non-k8s endpoints "
+                             "(k8sCluster.containerImage). In 'all', non-k8s rows "
+                             "have blank cluster/namespace/podName and blank "
+                             "eventCount.")
     parser.add_argument("--priority", choices=["low", "high"], default="low",
                         help="Query priority (default low: more generous rate limits).")
     parser.add_argument("--slice-minutes", type=int, default=60,
@@ -630,16 +676,20 @@ def main():
         parser.error("the window is empty: start (%s) is not before end (%s)"
                      % (start.isoformat(), end.isoformat()))
 
+    step2_query = build_step2_query(args.container_scope)
+
     start_ms, end_ms = to_epoch_ms(start), to_epoch_ms(end)
     print("Window: %s -> %s  (%d -> %d ms)"
           % (start.isoformat(), end.isoformat(), start_ms, end_ms))
+    print("Container scope: %s (%s)"
+          % (args.container_scope, CONTAINER_SCOPES[args.container_scope]))
     # Always state the resolved absolute path, so where output landed is never a
     # guess — a relative --out-dir is easy to misjudge.
     print("Output: %s" % os.path.abspath(args.out_dir))
 
     if args.dry_run:
         print("\nStep 1 query:\n  %s" % QUERY_STEP1)
-        print("\nStep 2 query:\n  %s" % QUERY_STEP2)
+        print("\nStep 2 query:\n  %s" % step2_query)
         print("\n%s is joined client-side on %s." % (JOINED_COLUMN, JOIN_KEY))
         slices = build_slices(start_ms, end_ms, args.slice_minutes)
         if args.split_minutes:
@@ -663,7 +713,7 @@ def main():
         counts = run_step1(args.host, args.token, start_ms, end_ms,
                            args.priority, args.out_dir)
     if not args.step1_only:
-        run_step2(args.host, args.token, start_ms, end_ms, args.priority,
+        run_step2(args.host, args.token, step2_query, start_ms, end_ms, args.priority,
                   args.slice_minutes, args.min_slice_minutes, args.out_dir,
                   args.fresh, counts, args.split_minutes)
 
