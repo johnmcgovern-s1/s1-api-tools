@@ -330,10 +330,12 @@ def fetch_restrictions(host, token, scope_params, include_parents,
         entries.extend(data)
         page += 1
         pagination = body.get("pagination") or {}
+        # totalItems is only reported on the first page by some tenants; show it
+        # when present and non-zero, otherwise just the running total.
         total = pagination.get("totalItems")
         print("  page %d: +%d entries (running total %d%s)"
               % (page, len(data), len(entries),
-                 "/%d" % total if total is not None else ""))
+                 "/%d" % total if total else ""))
         cursor = pagination.get("nextCursor")
         if not cursor:
             break

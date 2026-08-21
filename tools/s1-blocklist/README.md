@@ -177,8 +177,24 @@ Common to all commands: `--host`, `--token`, `--hash` (repeatable),
 
 ## Tests
 
-Stdlib-only, no network (monkeypatches the API layer):
+**Unit tests** — stdlib-only, no network (monkeypatch the API layer):
 
 ```bash
 python3 tools/s1-blocklist/tests/test_s1_blocklist.py
 ```
+
+**Read-only integration checks** — exercise the real read paths (blocklist GET +
+paging, IOC lookup, deprecated verdict, and `includeParents`/scope behaviour)
+against a live console. **No writes.** It's data-agnostic: it discovers a known
+value from the tenant's own blocklist at runtime, so it hardcodes nothing
+tenant-specific and works against any environment.
+
+```bash
+export S1_CONSOLE_TOKEN="<console API token>"
+export S1_HOST="your-console.sentinelone.net"
+export S1_ACCOUNT_ID="123..."          # and/or S1_SITE_ID
+python3 tools/s1-blocklist/tests/integration_readonly.py
+```
+
+Exit code is 0 only if every assertion passes; skips (empty blocklist, no TI
+permission, etc.) are reported but don't fail the run.
