@@ -24,6 +24,7 @@ flag to actually write.
 | [`sdl-container-coverage`](tools/sdl-container-coverage/) | Survey and prove what container telemetry exists across runtimes (Kubernetes vs ECS vs standalone). Answers "can we see all container activity regardless of runtime?" from tenant data. |
 | [`sdl-powerquery-probe`](tools/sdl-powerquery-probe/) | Diagnose a failing PowerQuery by bisecting it — sends a ladder of progressively complex queries and reports which construct the API rejects. |
 | [`s1-bulk-resolve`](tools/s1-bulk-resolve/) | ⚠️ **Writes.** Bulk-resolves alerts matching a caller-defined filter in a scope via the Unified Alerts GraphQL API (sets status + optional verdict/note). Generic across alert types; **defaults to a dry run**, requires `--apply` to write, and emits a per-alert CSV + run manifest. Supersedes the `bulk-resolve-identity-alerts` Postman collection. |
+| [`s1-blocklist`](tools/s1-blocklist/) | ⚠️ **Writes.** Answer "is this hash blocked by S1?" across all three systems that can block it — Global Blocklist (`/restrictions`), feed-ingested Threat Intelligence IOCs (`/threat-intelligence/iocs`), and Reputation verdict (best-effort) — then `add`/`remove` on the blocklist. Built for the ISAC/industry-group IOC workflow; `check` is read-only with a per-hash coverage verdict, **`add`/`remove` default to a dry run**, require `--apply`, and emit a CSV + manifest. Replaces reaching for the deprecated `hashes/{hash}/verdict`. |
 
 Each tool directory has its own README with usage, options, and output.
 
